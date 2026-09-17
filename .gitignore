@@ -1,0 +1,16 @@
+# 运行时产物（本机配置与日志，不上传）
+config.json
+config.json.bad
+config.json.tmp
+scheduler.lock
+logs/
+
+# Python
+__pycache__/
+*.pyc
+
+# PyInstaller 构建产物（exe 本身入库，构建中间物不入）
+_build/
+build/
+dist/
+*.spec
