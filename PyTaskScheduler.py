@@ -20,10 +20,11 @@ PyTaskScheduler —— Windows 下 Python 脚本定时任务调度器
 """
 
 import json
+import heapq
+import ctypes
 import msvcrt
 import os
 import re
-import shlex
 import subprocess
 import sys
 import threading
@@ -35,6 +36,8 @@ from datetime import datetime, timedelta, time as dtime
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
+
+from windows_process import attach_process, process_identity
 
 APP_NAME = "PyTask 调度器"
 
@@ -98,6 +101,8 @@ TASK_DEFAULTS = {
     "trigger_time": "09:00:00",     # 每天：HH:MM:SS
     "every_n_days": 1,              # 每天：每隔 N 天
     "start_date": None,             # 每天：起始日期 YYYY-MM-DD（空=今天）
+    "daily_repeat_every": 0,        # 每天：窗口内每 N 秒重复（0=每天仅一次）
+    "daily_repeat_duration": 0,     # 每天：每轮重复窗口持续秒数
     "interval_start": None,         # 间隔：起始时间 YYYY-MM-DD HH:MM:SS
     "interval_every": 300,          # 间隔：每 N 秒
     "interval_duration": 0,         # 间隔：持续 N 秒（0=无限期）
@@ -128,12 +133,7 @@ def safe_int(v, default):
 
 def _quote_arg(s):
     """Windows 参数引号化：含空格/引号的参数整体加引号（内部引号转义），用于 XML 导出与参数回存"""
-    s = str(s)
-    if not s:
-        return '""'
-    if re.search(r'[\s"]', s):
-        return '"' + s.replace('"', '\\"') + '"'
-    return s
+    return subprocess.list2cmdline([str(s)])
 
 
 def center_over_parent(win, parent):
@@ -285,11 +285,23 @@ def split_cmdline(s):
     """Windows 命令行参数拆分（保留带引号短语为整体）"""
     if not s or not str(s).strip():
         return []
+    shell32 = ctypes.WinDLL("shell32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    split = shell32.CommandLineToArgvW
+    split.argtypes = [ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_int)]
+    split.restype = ctypes.POINTER(ctypes.c_wchar_p)
+    free = kernel32.LocalFree
+    free.argtypes = [ctypes.c_void_p]
+    free.restype = ctypes.c_void_p
+    count = ctypes.c_int()
+    # argv[0] 的 Windows 解析规则不同，用占位程序名保证全部输入按参数处理。
+    argv = split("pytask.exe " + str(s), ctypes.byref(count))
+    if not argv:
+        raise ctypes.WinError(ctypes.get_last_error())
     try:
-        parts = shlex.split(str(s), posix=False)
-    except ValueError:
-        parts = str(s).split()
-    return [p.strip().strip('"').strip() for p in parts if p and p.strip()]
+        return [argv[i] for i in range(1, count.value)]
+    finally:
+        free(ctypes.cast(argv, ctypes.c_void_p))
 
 
 def kill_tree(pid):
@@ -384,6 +396,7 @@ def normalize_task(t):
         t.setdefault(k, v)
     if not t.get("id"):
         t["id"] = uuid.uuid4().hex[:12]
+    _ensure_schedule_anchor(t, datetime.now())
 
 
 def load_config():
@@ -425,50 +438,106 @@ def save_config(cfg):
             tmp = CONFIG_PATH + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(cfg, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
             os.replace(tmp, CONFIG_PATH)
+            return True
         except Exception:
             # 磁盘满/权限问题时不能静默：至少落盘错误日志（_exhook 自带 5MB 轮转防刷爆）
             _exhook(*sys.exc_info())
+            return False
 
 
 # ----------------------------------------------------------------------------
 # 触发时间计算
 # ----------------------------------------------------------------------------
 
+def _ensure_schedule_anchor(task, now_dt):
+    """将空起点固定到配置中；旧任务优先沿用已保存计划的节律。"""
+    tt = task.get("trigger_type", "daily")
+    previous = parse_dt(task.get("next_run")) or parse_dt(task.get("last_run"))
+    if tt == "daily" and parse_date(task.get("start_date")) is None:
+        anchor = previous or now_dt
+        start_day = anchor.date()
+        if previous and safe_int(task.get("daily_repeat_every"), 0) > 0:
+            # 跨午夜的重复格属于前一日开始的窗口。
+            start = datetime.combine(start_day, dtime(*parse_hms(task.get("trigger_time"))))
+            if anchor < start:
+                start_day -= timedelta(days=1)
+        task["start_date"] = start_day.isoformat()
+    elif tt == "interval" and parse_dt(task.get("interval_start")) is None:
+        task["interval_start"] = iso(previous or now_dt)
+
+
+def _daily_window_start(task, reference):
+    """返回 reference 所在周期的窗口起点，最早不早于已保存锚点。"""
+    anchor = datetime.combine(parse_date(task["start_date"]),
+                              dtime(*parse_hms(task.get("trigger_time"))))
+    cycle = timedelta(days=max(1, safe_int(task.get("every_n_days"), 1)))
+    count = max(0, (reference - anchor) // cycle)
+    return anchor + count * cycle, cycle
+
+
+def _grid_on_or_after(start, every, reference):
+    if reference <= start:
+        return start
+    step = timedelta(seconds=every)
+    count, remainder = divmod(reference - start, step)
+    return start + (count + bool(remainder)) * step
+
+
+def repetition_window_end(task, planned_dt):
+    """返回某次计划所属的有限重复窗口末端；无有限窗口则返回 None。"""
+    tt = task.get("trigger_type", "daily")
+    if tt == "interval":
+        duration = max(0, safe_int(task.get("interval_duration"), 0))
+        start = parse_dt(task.get("interval_start"))
+        return start + timedelta(seconds=duration) if start and duration else None
+    if tt == "daily" and safe_int(task.get("daily_repeat_every"), 0) > 0:
+        _ensure_schedule_anchor(task, planned_dt)
+        start, _ = _daily_window_start(task, planned_dt)
+        return start + timedelta(seconds=max(0, safe_int(task.get("daily_repeat_duration"), 0)))
+    return None
+
+
+def repetition_window_expired(task, planned_dt, now_dt):
+    """终点整格保留一秒轮询容忍；其他旧格不能越过窗口末端补跑。"""
+    end = repetition_window_end(task, planned_dt)
+    if end is None or now_dt <= end:
+        return False
+    return planned_dt != end or now_dt > end + timedelta(seconds=1)
+
+
 def compute_next_run(task, now_dt):
-    """计算下次运行时间；返回 datetime 或 None（已结束/无效）"""
+    """返回不早于 now_dt 的计划格；窗口末端若落在整格上则包含。"""
     tt = task.get("trigger_type", "daily")
     if tt == "once":
-        return parse_dt(task.get("once_datetime") or "")
+        planned = parse_dt(task.get("once_datetime"))
+        return planned if planned is not None and planned >= now_dt else None
+    _ensure_schedule_anchor(task, now_dt)
     if tt == "interval":
-        start = parse_dt(task.get("interval_start") or "")
-        if start is None:
-            start = now_dt
+        start = parse_dt(task.get("interval_start"))
         every = max(1, safe_int(task.get("interval_every"), 60))
         dur = max(0, safe_int(task.get("interval_duration"), 0))
-        if now_dt < start:
-            return start
-        elapsed = (now_dt - start).total_seconds()
-        k = int(elapsed // every) + 1
-        nxt = start + timedelta(seconds=k * every)
+        nxt = _grid_on_or_after(start, every, now_dt)
         if dur > 0 and nxt > start + timedelta(seconds=dur):
             return None
         return nxt
     # daily：每天 / 每隔 N 天
-    h, m, sec = parse_hms(task.get("trigger_time"))
-    n = max(1, safe_int(task.get("every_n_days"), 1))
-    sd = parse_date(task.get("start_date")) or now_dt.date()
-    if sd > now_dt.date():
-        d = sd
-    else:
-        delta = (now_dt.date() - sd).days
-        d = sd + timedelta(days=delta - (delta % n))
-    for _ in range(10000):
-        cand = datetime.combine(d, dtime(h, m, sec))
-        if cand >= now_dt:
-            return cand
-        d = d + timedelta(days=n)
-    return None
+    if tt != "daily":
+        return None
+    start, cycle = _daily_window_start(task, now_dt)
+    try:
+        every, duration = _daily_repeat_values(task.get("daily_repeat_every", 0),
+                                               task.get("daily_repeat_duration", 0), cycle.days)
+    except ValueError:
+        return None
+    if every == 0:
+        return start if start >= now_dt else start + cycle
+    nxt = _grid_on_or_after(start, every, now_dt)
+    if nxt <= start + timedelta(seconds=duration):
+        return nxt
+    return start + cycle
 
 
 def trigger_desc(task):
@@ -482,7 +551,12 @@ def trigger_desc(task):
         return "每 %s（持续 %s）" % (every, ds)
     n = max(1, safe_int(task.get("every_n_days"), 1))
     rep = "每天" if n == 1 else "每 %d 天" % n
-    return "%s %s" % (rep, task.get("trigger_time", ""))
+    desc = "%s %s" % (rep, task.get("trigger_time", ""))
+    every = max(0, safe_int(task.get("daily_repeat_every"), 0))
+    if every:
+        desc += "，每 %s重复（持续 %s）" % (
+            human_secs(every), human_secs(safe_int(task.get("daily_repeat_duration"), 0)))
+    return desc
 
 
 # ----------------------------------------------------------------------------
@@ -493,11 +567,16 @@ class Scheduler(object):
 
     def __init__(self, cfg):
         self.cfg = cfg
-        self.lock = threading.RLock()
+        self.lock = CFG_LOCK
+        self._launch_condition = threading.Condition(self.lock)
         self.log_lock = threading.Lock()
         self.running = {}          # task_id -> Popen
         self.stop_event = threading.Event()
         self._starting = set()     # 正在异步启动中的 task_id（防重复触发）
+        self._cancelled = set()    # 已取消的待启动操作，删除失败时也不继续启动
+        self._workers = set()
+        self._closing = False
+        self._generations = {}
         self._dirty = False        # 配置待落盘标记（高频任务下节流写盘）
         self.day_stats = {"day": datetime.now().strftime("%Y-%m-%d"),
                           "success": 0, "failed": 0, "skipped": 0, "error": 0, "timeout": 0}
@@ -508,13 +587,58 @@ class Scheduler(object):
     # ---- 启动 / 停止 ------------------------------------------------------
 
     def start(self):
+        self._restore_running()
         # 清理放后台线程：logs 目录文件多时避免阻塞 UI 启动
         threading.Thread(target=self._cleanup_runs_log, daemon=True).start()
         self.thread.start()
         self.flush_thread.start()
 
+    def _restore_running(self):
+        """接管有持久化身份且仍存活的实例，避免重启后绕过冲突和超时限制。"""
+        with self.lock:
+            for task in self.cfg["tasks"]:
+                record = task.get("active_run")
+                if not record or task["id"] in self.running:
+                    continue
+                try:
+                    proc = attach_process(record["pid"], record["created"])
+                    if proc is None:
+                        task.pop("active_run", None)
+                        task["last_result"] = "运行已结束（调度器离线期间，结果未知）"
+                        continue
+                    started = parse_dt(record.get("started"))
+                    if started is None:
+                        proc.close()
+                        raise ValueError("恢复记录缺少有效开始时间")
+                    snapshot = dict(record.get("task") or task)
+                    snapshot["id"] = task["id"]
+                    proc._pytask_started = started
+                    self.running[task["id"]] = proc
+                    task["last_result"] = "运行中（已恢复管理）"
+                    threading.Thread(target=self._watch,
+                                     args=(snapshot, proc, None, parse_dt(record.get("planned")) or started,
+                                           bool(record.get("missed"))), daemon=True).start()
+                except Exception:
+                    task["enabled"] = False
+                    self._cancelled.add(task["id"])
+                    task["last_result"] = "错误：无法核对旧进程，已停用任务"
+                    _exhook(*sys.exc_info())
+            self._dirty = not save_config(self.cfg)
+
     def stop(self):
-        self.stop_event.set()
+        with self.lock:
+            self.stop_event.set()
+            self._launch_condition.notify_all()
+            workers = list(self._workers)
+        # 禁止新进程先于等待；不等待任务本身结束。
+        for worker in workers:
+            if worker is not threading.current_thread():
+                worker.join(timeout=1.0)
+
+    def set_closing(self, closing):
+        with self._launch_condition:
+            self._closing = closing
+            self._launch_condition.notify_all()
 
     def mark_dirty(self):
         self._dirty = True
@@ -524,9 +648,9 @@ class Scheduler(object):
         顺带跨天重跑日志清理：常驻数周不重启时保留天数策略不会失效。"""
         last_day = datetime.now().strftime("%Y-%m-%d")
         while not self.stop_event.wait(1.0):
-            if self._dirty:
-                self._dirty = False
-                save_config(self.cfg)
+            with self.lock:
+                if self._dirty and save_config(self.cfg):
+                    self._dirty = False
             day = datetime.now().strftime("%Y-%m-%d")
             if day != last_day:
                 last_day = day
@@ -537,18 +661,28 @@ class Scheduler(object):
 
     def _recompute_all(self):
         now = datetime.now()
-        for t in self.cfg["tasks"]:
-            if not t.get("enabled") or t.get("finished"):
-                continue
-            try:
-                nxt = compute_next_run(t, now)
-            except Exception:
-                _exhook(*sys.exc_info())
-                nxt = None
-            t["next_run"] = iso(nxt)
-            if nxt is None:
-                t["finished"] = True   # 已到期（如持续时长结束）
-        self._dirty = True
+        with self.lock:
+            for t in self.cfg["tasks"]:
+                try:
+                    normalize_task(t)
+                    if not t.get("enabled") or t.get("finished"):
+                        continue
+                    saved = parse_dt(t.get("next_run"))
+                    if saved is not None and compute_next_run(t, saved) == saved:
+                        # 保留有效的过去计划，交给同一套错过策略判断是否补跑。
+                        nxt = saved
+                    elif t.get("trigger_type") == "once":
+                        nxt = parse_dt(t.get("once_datetime"))
+                    else:
+                        nxt = compute_next_run(t, now)
+                except Exception:
+                    _exhook(*sys.exc_info())
+                    nxt = None
+                t["next_run"] = iso(nxt)
+                if nxt is None:
+                    t["finished"] = True
+            # 起点和恢复后的计划先落盘，避免每次启动重新定义节律。
+            self._dirty = not save_config(self.cfg)
 
     def _cleanup_runs_log(self):
         """按保留天数清理按天滚动的日志文件（0=永久保留）"""
@@ -609,13 +743,12 @@ class Scheduler(object):
         """单轮调度。返回最近一次未来触发时刻的 epoch（无则 None）。"""
         now = datetime.now()
         now_epoch = time.time()
-        try:
-            grace = int(self.cfg["settings"].get("missed_grace_seconds", 300))
-        except Exception:
-            grace = 300
-        policy = self.cfg["settings"].get("missed_policy", "run_once")
+        with self.lock:
+            grace = max(0, safe_int(self.cfg["settings"].get("missed_grace_seconds"), 300))
+            policy = self.cfg["settings"].get("missed_policy", "run_once")
+            tasks = list(self.cfg["tasks"])
         nearest = None
-        for task in list(self.cfg["tasks"]):
+        for task in tasks:
             if self.stop_event.is_set():
                 return nearest
             if not task.get("enabled") or task.get("finished"):
@@ -628,47 +761,47 @@ class Scheduler(object):
         return nearest
 
     def _tick_one(self, task, now, now_epoch, grace, policy, nearest):
-        nr = task.get("next_run")
-        if not nr:
-            return nearest
-        nd = parse_dt(nr)
-        if nd is None:
-            with self.lock:
-                nxt = compute_next_run(task, now)
+        with self.lock:
+            # UI 可能已替换、删除或停用本轮快照中的任务。
+            if (self.stop_event.is_set() or self._closing
+                    or not any(current is task for current in self.cfg["tasks"])
+                    or not task.get("enabled") or task.get("finished")):
+                return nearest
+            nd = parse_dt(task.get("next_run"))
+            if nd is None:
+                nxt = (parse_dt(task.get("once_datetime")) if task.get("trigger_type") == "once"
+                       else compute_next_run(task, now))
                 task["next_run"] = iso(nxt)
                 if nxt is None:
                     task["finished"] = True
-            self._dirty = True
-            return nearest
-        nd_epoch = time.mktime(nd.timetuple()) + nd.microsecond / 1000000.0
-        if now_epoch < nd_epoch:
-            if nearest is None or nd_epoch < nearest:
-                nearest = nd_epoch
-        if now < nd:
-            return nearest
-        late = (now - nd).total_seconds()
-        if task.get("trigger_type") == "once":
-            if late > grace:
-                # 单次任务错过太久，直接结束不补跑
-                with self.lock:
-                    task["finished"] = True
-                    task["next_run"] = None
+                self._dirty = True
+                if task.get("trigger_type") != "once" or nxt is None:
+                    return nearest
+                nd = nxt  # 新建/导入的过去单次计划也走同一套宽限判断。
+            nd_epoch = nd.timestamp()
+            if now < nd:
+                return nd_epoch if nearest is None else min(nearest, nd_epoch)
+            late = (now - nd).total_seconds()
+            old_next, old_finished = task.get("next_run"), task.get("finished", False)
+            if task.get("trigger_type") == "once":
+                should_fire = late <= grace
+                nxt = None
             else:
+                should_fire = not repetition_window_expired(task, nd, now)
+                should_fire = should_fire and not (late > grace and policy == "skip")
+                # 消费本次格后直接进入未来；不逐格追赶，也不在整秒重复触发。
+                nxt = compute_next_run(task, now + timedelta(microseconds=1))
+            task["next_run"] = iso(nxt)
+            task["finished"] = nxt is None
+            # 在启动之前持久化消费结果；崩溃恢复不重放已经消费的同一格。
+            if not save_config(self.cfg):
+                task["next_run"], task["finished"] = old_next, old_finished
+                self._dirty = True
+                return nearest
+            if should_fire:
                 self._fire_async(task, nd, missed=late > grace)
-                with self.lock:
-                    task["finished"] = True
-                    task["next_run"] = None
-            self._dirty = True
-        else:
-            skip = (late > grace) and (policy == "skip")
-            if not skip:
-                self._fire_async(task, nd, missed=late > grace)
-            with self.lock:
-                nxt = compute_next_run(task, now)
-                task["next_run"] = iso(nxt)
-                if nxt is None:
-                    task["finished"] = True   # 持续时长已结束
-            self._dirty = True
+            if nxt is not None:
+                nearest = nxt.timestamp() if nearest is None else min(nearest, nxt.timestamp())
         return nearest
 
     # ---- 路径解析 ----------------------------------------------------------
@@ -702,25 +835,48 @@ class Scheduler(object):
         避免多个高频任务在同一轮触发时互相排队造成触发时刻漂移。"""
         tid = task["id"]
         with self.lock:  # 检查 + 占位必须原子：调度线程与 UI 手动"立即运行"可能同时进入
+            if not self._can_launch(task, manual):
+                return False
             if tid in self._starting:
                 ts = datetime.now()
                 self.log_run(task, planned_dt or ts, ts, ts, "skipped",
                              "上一次尚未完成启动，跳过本次", None, missed, 0.0)
                 task["last_result"] = "跳过（上次未结束）"
-                return
+                self._dirty = True
+                return False
             self._starting.add(tid)
-        threading.Thread(
-            target=self._fire_body, args=(task, planned_dt, missed, manual),
-            daemon=True,
-        ).start()
+            generation = self._generations.get(tid, 0)
+            worker = threading.Thread(
+                target=self._fire_body, args=(task, planned_dt, missed, manual, generation),
+                daemon=True,
+            )
+            self._workers.add(worker)
+            try:
+                worker.start()
+            except Exception:
+                self._workers.discard(worker)
+                self._starting.discard(tid)
+                raise
+        return True
 
-    def _fire_body(self, task, planned_dt, missed, manual):
+    def _can_launch(self, task, manual=False):
+        """调用方持有 self.lock；手动运行允许停用任务，但不允许已删除任务。"""
+        if self.stop_event.is_set() or self._closing or task["id"] in self._cancelled:
+            return False
+        current = next((t for t in self.cfg["tasks"] if t.get("id") == task["id"]), None)
+        if current is not None and current.get("active_run") and task["id"] not in self.running:
+            return False  # 未核实的旧进程必须先恢复，不能仅重新启用就绕过身份检查。
+        return current is not None and (manual or bool(current.get("enabled")))
+
+    def _fire_body(self, task, planned_dt, missed, manual, generation=None):
         try:
-            self.fire(task, planned_dt, missed, manual)
+            self.fire(task, planned_dt, missed, manual, generation=generation)
         except Exception:
             _exhook(*sys.exc_info())
         finally:
-            self._starting.discard(task["id"])
+            with self.lock:
+                self._starting.discard(task["id"])
+                self._workers.discard(threading.current_thread())
 
     def _kill_and_confirm(self, proc, wait_secs=5):
         """杀进程树并确认死亡。返回 True=确认已退出，False=未能杀死（权限拒绝等）"""
@@ -731,11 +887,22 @@ class Scheduler(object):
             pass
         return proc.poll() is not None
 
-    def fire(self, task, planned_dt=None, missed=False, manual=False):
+    def fire(self, task, planned_dt=None, missed=False, manual=False, generation=None):
         """执行一次任务运行（应通过 _fire_async 调用，运行在工作线程中）。
         返回 True 表示已启动进程。"""
         if planned_dt is None:
             planned_dt = datetime.now()
+        with self.lock:
+            while self._closing and not self.stop_event.is_set():
+                self._launch_condition.wait(0.2)
+            if not self._can_launch(task, manual):
+                return False
+            if generation is None:
+                generation = self._generations.get(task["id"], 0)
+            if generation != self._generations.get(task["id"], 0):
+                return False
+            config_task = task
+            task = dict(task)  # 运行参数快照，编辑不改变正在运行实例的超时和日志归属。
         exe, err = self.resolve_python()
         script = None
         if err is None:
@@ -746,7 +913,7 @@ class Scheduler(object):
             ts = datetime.now()
             self.log_run(task, planned_dt, ts, ts, "error", err, None, missed, 0.0)
             with self.lock:
-                task["last_result"] = "错误：" + err
+                config_task["last_result"] = "错误：" + err
             self._dirty = True
             return False
         if not os.path.isfile(script):
@@ -754,23 +921,34 @@ class Scheduler(object):
             ts = datetime.now()
             self.log_run(task, planned_dt, ts, ts, "error", msg, None, missed, 0.0)
             with self.lock:
-                task["last_result"] = "错误：" + msg
+                config_task["last_result"] = "错误：" + msg
             self._dirty = True
             return False
 
         # 冲突策略：上一次还在运行
-        proc = self.running.get(task["id"])
+        with self.lock:
+            while self._closing and not self.stop_event.is_set():
+                self._launch_condition.wait(0.2)
+            if not self._can_launch(task, manual) or generation != self._generations.get(task["id"], 0):
+                return False
+            proc = self.running.get(task["id"])
         if proc is not None and proc.poll() is None:
             if task.get("conflict") == "kill_previous":
                 # 在进程对象上打标记：pid 可能被系统复用，对象引用不会认错
-                proc._pytask_killed = True
-                if not self._kill_and_confirm(proc, 5):
+                with self.lock:
+                    while self._closing and not self.stop_event.is_set():
+                        self._launch_condition.wait(0.2)
+                    if not self._can_launch(task, manual) or generation != self._generations.get(task["id"], 0):
+                        return False
+                    proc._pytask_killed = True
+                    killed = self._kill_and_confirm(proc, 5)
+                if not killed:
                     # 上一次没杀掉：绝不同时开第二个实例（违背冲突策略语义）
                     ts = datetime.now()
                     self.log_run(task, planned_dt, ts, ts, "error",
                                  "终止上一次运行失败，本次取消", None, missed, 0.0)
                     with self.lock:
-                        task["last_result"] = "错误：终止上一次失败"
+                        config_task["last_result"] = "错误：终止上一次失败"
                     self._dirty = True
                     return False
                 # 旧 watcher 会记录“被终止”，这里继续启动新一次
@@ -779,7 +957,7 @@ class Scheduler(object):
                 note = "上一次仍在运行，跳过本次" + ("（手动运行）" if manual else "")
                 self.log_run(task, planned_dt, ts, ts, "skipped", note, None, missed, 0.0)
                 with self.lock:
-                    task["last_result"] = "跳过（上次未结束）"
+                    config_task["last_result"] = "跳过（上次未结束）"
                 self._dirty = True
                 return False
 
@@ -790,38 +968,72 @@ class Scheduler(object):
             ts = datetime.now()
             self.log_run(task, planned_dt, ts, ts, "error", msg, None, missed, 0.0)
             with self.lock:
-                task["last_result"] = "错误：" + msg
+                config_task["last_result"] = "错误：" + msg
             self._dirty = True
             return False
 
         arg_list = []
         if str(task.get("args") or "").strip():
-            # 必须 posix=False：Windows 路径反斜杠在 posix 模式下被当转义符吞掉
+            # 使用 Windows 参数规则，保留空参数、内嵌引号和路径末尾反斜杠。
             arg_list = split_cmdline(str(task["args"])) or [str(task["args"])]
         cmd = [exe, script] + list(arg_list)
 
         lf = None
         try:
-            if task.get("console") == "window":
-                proc = subprocess.Popen(cmd, cwd=cwd, creationflags=CREATE_NEW_CONSOLE)
-            else:
-                os.makedirs(LOGS_DIR, exist_ok=True)
-                # 同任务同天合并为一个文件（追加写）：1 秒级高频任务不再每天产生数万个小文件。
-                # append 语义保证写入始终落在文件末尾，header 与子进程输出共用同一句柄，
-                # 每次触发少 2 次 open/close（降低高频场景 IO 与杀毒扫描开销）
-                day = datetime.now().strftime("%Y%m%d")
-                logfile = os.path.join(LOGS_DIR, "run_%s_%s.log" % (task["id"], day))
-                lf = open(logfile, "a", encoding="utf-8", errors="replace")
-                try:
-                    lf.write("\n===== [%s] 开始运行 =====\n" % now_str())
+            # 复查和创建进程在同一把锁内，删除/退出不会穿过最后一次检查。
+            with self.lock:
+                while self._closing and not self.stop_event.is_set():
+                    self._launch_condition.wait(0.2)
+                if not self._can_launch(task, manual):
+                    return False
+                if generation != self._generations.get(task["id"], 0):
+                    return False
+                if not manual and repetition_window_expired(task, planned_dt, datetime.now()):
+                    ts = datetime.now()
+                    self.log_run(task, planned_dt, ts, ts, "skipped", "重复窗口已结束", None, missed, 0.0)
+                    config_task["last_result"] = "跳过（重复窗口已结束）"
+                    self._dirty = True
+                    return False
+                started = datetime.now()
+                if task.get("console") == "window":
+                    proc = subprocess.Popen(cmd, cwd=cwd, creationflags=CREATE_NEW_CONSOLE)
+                else:
+                    os.makedirs(LOGS_DIR, exist_ok=True)
+                    day = started.strftime("%Y%m%d")
+                    logfile = os.path.join(LOGS_DIR, "run_%s_%s.log" % (task["id"], day))
+                    lf = open(logfile, "a", encoding="utf-8", errors="replace")
+                    lf.write("\n===== [%s] 开始运行 =====\n" % started.strftime(TIME_FMT))
                     lf.flush()
+                    proc = subprocess.Popen(
+                        cmd, cwd=cwd, stdout=lf, stderr=lf,
+                        stdin=subprocess.DEVNULL,
+                        creationflags=CREATE_NO_WINDOW,
+                    )
+                proc._pytask_started = started
+                self.running[task["id"]] = proc
+                config_task["last_run"] = iso(started)
+                config_task["last_result"] = "运行中…"
+                config_task["last_run_duration"] = None
+                self._dirty = True
+                try:
+                    identity = process_identity(proc)
+                    config_task["active_run"] = {
+                        "pid": proc.pid, "created": identity, "started": iso(started),
+                        "planned": iso(planned_dt), "missed": bool(missed),
+                        "task": {key: value for key, value in task.items() if key != "active_run"},
+                    }
+                    if not save_config(self.cfg):
+                        raise OSError("运行进程身份保存失败")
                 except Exception:
-                    pass
-                proc = subprocess.Popen(
-                    cmd, cwd=cwd, stdout=lf, stderr=lf,
-                    stdin=subprocess.DEVNULL,
-                    creationflags=CREATE_NO_WINDOW,
-                )
+                    # 无法记录身份时不得继续放任一个重启后无法识别的实例运行。
+                    config_task["enabled"] = False
+                    self._cancelled.add(task["id"])
+                    proc._pytask_launch_error = "运行身份保存失败，任务已停用"
+                    proc._pytask_killed = True
+                    self._kill_and_confirm(proc)
+                    config_task["last_result"] = "错误：运行身份保存失败，任务已停用"
+                    self._dirty = True
+                    _exhook(*sys.exc_info())
         except Exception as e:
             if lf:
                 try:
@@ -831,15 +1043,10 @@ class Scheduler(object):
             ts = datetime.now()
             self.log_run(task, planned_dt, ts, ts, "error", "启动失败：%s" % e, None, missed, 0.0)
             with self.lock:
-                task["last_result"] = "错误：启动失败"
+                config_task["last_result"] = "错误：启动失败"
             self._dirty = True
             return False
 
-        self.running[task["id"]] = proc
-        with self.lock:
-            task["last_run"] = iso(datetime.now())
-            task["last_result"] = "运行中…"
-            task["last_run_duration"] = None
         threading.Thread(
             target=self._watch, args=(task, proc, lf, planned_dt, missed),
             daemon=True,
@@ -847,7 +1054,7 @@ class Scheduler(object):
         return True
 
     def _watch(self, task, proc, lf, planned_dt, missed):
-        start_dt = datetime.now()
+        start_dt = getattr(proc, "_pytask_started", datetime.now())
         status = None
         exit_code = None
         note = ""
@@ -857,7 +1064,8 @@ class Scheduler(object):
             timeout = 0
         try:
             if timeout > 0:
-                exit_code = proc.wait(timeout=timeout)
+                remaining = max(0.0, timeout - (datetime.now() - start_dt).total_seconds())
+                exit_code = proc.wait(timeout=remaining)
             else:
                 exit_code = proc.wait()
         except subprocess.TimeoutExpired:
@@ -872,7 +1080,10 @@ class Scheduler(object):
             note = "等待进程失败：%s" % e
         end_dt = datetime.now()
         dur = (end_dt - start_dt).total_seconds()
-        if status is None:
+        if getattr(proc, "_pytask_launch_error", None):
+            status = "error"
+            note = proc._pytask_launch_error
+        elif status is None:
             if getattr(proc, "_pytask_killed", False):
                 status = "killed"
                 note = "被同任务的新一次运行终止"
@@ -888,13 +1099,21 @@ class Scheduler(object):
                 pass
         self.log_run(task, planned_dt, start_dt, end_dt, status, note, exit_code, missed, dur)
         with self.lock:
-            task["last_result"] = STATUS_CN.get(status, status)
-            task["last_run"] = iso(start_dt)
-            task["last_run_duration"] = round(dur, 1)
-        # 仅在进程确认退出后才清掉占位：kill 失败的残留进程保留下一次触发的冲突判断
-        if self.running.get(task["id"]) is proc and proc.poll() is not None:
-            self.running.pop(task["id"], None)
-        self._dirty = True
+            if self.running.get(task["id"]) is proc:
+                current = next((t for t in self.cfg["tasks"] if t.get("id") == task["id"]), None)
+                if current is not None:
+                    current["last_result"] = STATUS_CN.get(status, status)
+                    current["last_run"] = iso(start_dt)
+                    current["last_run_duration"] = round(dur, 1)
+                # 强制终止失败时保留进程，继续用于下一次冲突判断。
+                if proc.poll() is not None:
+                    self.running.pop(task["id"], None)
+                    if current is not None:
+                        current.pop("active_run", None)
+            self._dirty = True
+        # 附着的进程句柄独立于 Popen，仅在其生命周期结束后关闭。
+        if proc.poll() is not None and hasattr(proc, "close"):
+            proc.close()
 
     # ---- 运行记录 ----------------------------------------------------------
 
@@ -932,8 +1151,9 @@ class Scheduler(object):
         )
         runs_path = os.path.join(LOGS_DIR, "runs-%s.jsonl" % day)  # 按天滚动，防单文件无限膨胀
         with self.log_lock:
-            if self.day_stats["day"] != day:
-                self.day_stats = {"day": day, "success": 0, "failed": 0,
+            today = datetime.now().strftime("%Y-%m-%d")
+            if self.day_stats["day"] != today:
+                self.day_stats = {"day": today, "success": 0, "failed": 0,
                                   "skipped": 0, "error": 0, "timeout": 0}
             self.day_stats[status] = self.day_stats.get(status, 0) + 1
             try:
@@ -949,10 +1169,30 @@ class Scheduler(object):
                 pass
 
     def kill_running(self, task_id):
-        proc = self.running.get(task_id)
+        with self.lock:
+            proc = self.running.get(task_id)
+            if proc is None and any(t.get("id") == task_id and t.get("active_run")
+                                    for t in self.cfg["tasks"]):
+                return False  # 身份尚未核实，不得当作已退出并删除唯一的恢复记录。
         if proc is not None and proc.poll() is None:
             proc._pytask_killed = True
-            kill_tree(proc.pid)
+            return self._kill_and_confirm(proc)
+        return True
+
+    def cancel_task(self, task_id):
+        """先取消待启动，再确认现有实例结束；失败保留任务和进程的管理关系。"""
+        with self.lock:
+            self._cancelled.add(task_id)
+            self._generations[task_id] = self._generations.get(task_id, 0) + 1
+        if not self.kill_running(task_id):
+            with self.lock:
+                for task in self.cfg["tasks"]:
+                    if task.get("id") == task_id:
+                        task["enabled"] = False
+                        task["last_result"] = "错误：终止失败，已停用后续调度"
+                self._dirty = True
+            return False
+        return True
 
 
 # ----------------------------------------------------------------------------
@@ -961,6 +1201,36 @@ class Scheduler(object):
 
 def _q(tag):
     return "{%s}%s" % (TS_NS, tag)
+
+
+def _schedule_integer(value, label, minimum=0):
+    text = str(value).strip()
+    if not re.fullmatch(r"[0-9]+", text) or int(text) < minimum:
+        raise ValueError("%s必须是%s整数。" % (label, "正" if minimum else "非负"))
+    return int(text)
+
+
+def _daily_repeat_values(every, duration, days):
+    every = _schedule_integer(every, "重复间隔")
+    if not every:
+        return 0, 0
+    duration = _schedule_integer(duration, "重复持续时间", 1)
+    if every > duration:
+        raise ValueError("重复间隔不能大于持续时间。")
+    if duration > days * 86400:
+        raise ValueError("重复持续时间不能超过每隔 N 天的周期。")
+    return every, duration
+
+
+def _xml_duration_seconds(value, label, minimum=0):
+    value = str(value).strip()
+    match = re.fullmatch(r"P(?:(\d+)D)?(?:T(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?)?", value)
+    if not match or not any(match.groups()) or value.endswith("T"):
+        raise ValueError("%s不支持或格式错误（只支持天、时、分和整数秒）：%s" % (label, value))
+    seconds = parse_iso_duration(value)
+    if seconds < minimum:
+        raise ValueError("%s不得少于 %d 秒。" % (label, minimum))
+    return seconds
 
 
 def import_task_xml(path):
@@ -975,6 +1245,9 @@ def import_task_xml(path):
     root = tree.getroot()
 
     # ---- 动作：<Exec><Command><Arguments><WorkingDirectory>
+    actions = root.find(_q("Actions"))
+    if actions is None or len(actions) != 1 or actions[0].tag != _q("Exec"):
+        return None, None, "仅支持恰好一个执行 Python 脚本的 Exec 动作。"
     cmd, args_s, workdir = None, "", ""
     for exec_el in root.iter(_q("Exec")):
         c = (exec_el.findtext(_q("Command"), default="") or "").strip().strip('"').strip()
@@ -1012,78 +1285,98 @@ def import_task_xml(path):
 
     # ---- 触发器
     warnings = []
-    chosen = None
     triggers_el = root.find(_q("Triggers"))
-    if triggers_el is not None:
-        for el in list(triggers_el):
-            tag = el.tag.split("}")[-1]
-            if tag not in ("TimeTrigger", "CalendarTrigger", "LogonTrigger", "BootTrigger",
-                           "IdleTrigger", "EventTrigger", "RegistrationTrigger",
-                           "SessionStateChangeTrigger"):
-                continue
-            rep = el.find(_q("Repetition"))
-            rep_interval = ""
-            if rep is not None:
-                rep_interval = (rep.findtext(_q("Interval"), default="") or "").strip()
-            sb = (el.findtext(_q("StartBoundary"), default="") or "").strip()
-            if rep_interval:
-                every = parse_iso_duration(rep_interval)
-                if every <= 0:
-                    warnings.append("重复间隔无法解析：%s" % rep_interval)
-                    continue
-                start_b = parse_boundary(sb) or datetime.now()
-                dur_s = ""
-                if rep is not None:
-                    dur_s = (rep.findtext(_q("Duration"), default="") or "").strip()
-                duration = parse_iso_duration(dur_s) if dur_s else 0
-                chosen = {"type": "interval", "start": start_b,
-                          "every": every, "duration": duration}
-                break
-            if tag == "TimeTrigger":
-                start_b = parse_boundary(sb)
-                if start_b:
-                    chosen = {"type": "once", "dt": start_b}
-                    break
-            elif tag == "CalendarTrigger":
-                start_b = parse_boundary(sb) or datetime.now()
-                byday = el.find(_q("ScheduleByDay"))
-                if byday is not None:
-                    try:
-                        n = int(byday.findtext(_q("DaysInterval"), default="1") or "1")
-                    except Exception:
-                        n = 1
-                    chosen = {"type": "daily", "time": start_b.time(),
-                              "n": max(1, n), "start_date": start_b.date()}
-                else:
-                    warnings.append("周 / 月触发器不支持，已转为“每天同一时间”运行")
-                    chosen = {"type": "daily", "time": start_b.time(),
-                              "n": 1, "start_date": start_b.date()}
-                break
-            else:
-                warnings.append("忽略不支持的触发器：%s" % tag)
-    if chosen is None:
-        return None, python_dir_found, "没有可识别的触发器（支持：指定时间 / 每天 / 每隔 N 天 / 间隔重复）"
+    if triggers_el is None or len(triggers_el) != 1:
+        return None, python_dir_found, "仅支持恰好一个触发器；多触发器任务请先拆分。"
+    el = triggers_el[0]
+    tag = el.tag.split("}")[-1]
+    if el.tag not in (_q("TimeTrigger"), _q("CalendarTrigger")):
+        return None, python_dir_found, "不支持的触发器：%s" % tag
+    try:
+        allowed = {"Enabled", "StartBoundary", "EndBoundary", "Repetition", "ExecutionTimeLimit", "RandomDelay"}
+        if tag == "CalendarTrigger":
+            allowed.add("ScheduleByDay")
+        seen = set()
+        for child in el:
+            child_tag = child.tag.split("}")[-1]
+            if child.tag != _q(child_tag) or child_tag not in allowed or child_tag in seen:
+                raise ValueError("不支持或重复的触发器参数：%s" % child_tag)
+            seen.add(child_tag)
+        if el.find(_q("EndBoundary")) is not None:
+            raise ValueError("暂不支持设有 EndBoundary 截止日期的触发器。")
+        for field in ("RandomDelay", "ExecutionTimeLimit"):
+            value = el.findtext(_q(field))
+            if value is not None and _xml_duration_seconds(value, field) != 0:
+                raise ValueError("暂不支持触发器参数 %s。" % field)
+        sb = (el.findtext(_q("StartBoundary"), default="") or "").strip()
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.0+)?)?", sb):
+            raise ValueError("StartBoundary 必须是本地日期时间；不支持时区或非整数秒。")
+        start_b = datetime.fromisoformat(sb)
+        trigger_enabled = (el.findtext(_q("Enabled"), default="true") or "").strip().lower()
+        if trigger_enabled not in ("true", "false", "1", "0"):
+            raise ValueError("触发器 Enabled 值无效。")
+        rep = el.find(_q("Repetition"))
+        every, duration = 0, 0
+        if rep is not None:
+            rep_tags = [child.tag for child in rep]
+            if (len(rep_tags) != len(set(rep_tags)) or
+                    any(x not in {_q("Interval"), _q("Duration"), _q("StopAtDurationEnd")} for x in rep_tags)):
+                raise ValueError("Repetition 中包含重复或不支持的参数。")
+            every = _xml_duration_seconds(rep.findtext(_q("Interval"), default=""), "重复间隔", 60)
+            if every > 31 * 86400:
+                raise ValueError("Windows XML 重复间隔不能超过 31 天。")
+            dur_s = rep.findtext(_q("Duration"))
+            duration = _xml_duration_seconds(dur_s, "重复持续时间", 60) if dur_s is not None else 0
+            stop = (rep.findtext(_q("StopAtDurationEnd"), default="false") or "").strip().lower()
+            if stop not in ("false", "0"):
+                raise ValueError("不支持 StopAtDurationEnd：本程序在窗口结束后不强制终止正在运行的任务。")
+            if duration and every > duration:
+                raise ValueError("重复间隔不能大于持续时间。")
+        if tag == "CalendarTrigger":
+            byday = el.find(_q("ScheduleByDay"))
+            if byday is None or any(child.tag != _q("DaysInterval") for child in byday) or len(byday) > 1:
+                raise ValueError("仅支持每天 / 每隔 N 天的 ScheduleByDay 触发器。")
+            n = _schedule_integer(byday.findtext(_q("DaysInterval"), default="1"), "天数", 1)
+            if n > 365:
+                raise ValueError("Windows XML 每隔天数不能超过 365 天。")
+            every, duration = _daily_repeat_values(every, duration, n)
+            chosen = {"type": "daily", "time": start_b.time(), "n": n,
+                      "start_date": start_b.date(), "every": every, "duration": duration}
+        elif rep is not None:
+            chosen = {"type": "interval", "start": start_b, "every": every, "duration": duration}
+        else:
+            chosen = {"type": "once", "dt": start_b}
+    except (ValueError, OverflowError) as e:
+        return None, python_dir_found, "无法导入触发器：%s" % e
 
     # ---- 设置
-    timeout = 0
+    timeout = 72 * 3600  # Windows Task Scheduler 的缺省 ExecutionTimeLimit。
     conflict = "skip_new"
     enabled = True
     settings_el = root.find(_q("Settings"))
     if settings_el is not None:
-        etl = (settings_el.findtext(_q("ExecutionTimeLimit"), default="") or "").strip()
-        if etl:
-            timeout = parse_iso_duration(etl)
-        mip = (settings_el.findtext(_q("MultipleInstancesPolicy"), default="") or "").strip()
-        if mip == "StopExisting":
-            conflict = "kill_previous"
-        en = (settings_el.findtext(_q("Enabled"), default="true") or "true").strip().lower()
-        enabled = en not in ("false", "0")
+        try:
+            etl = settings_el.findtext(_q("ExecutionTimeLimit"))
+            if etl is not None:
+                timeout = _xml_duration_seconds(etl, "运行超时限制")
+            mip = (settings_el.findtext(_q("MultipleInstancesPolicy"), default="IgnoreNew") or "").strip()
+            if mip not in ("IgnoreNew", "StopExisting"):
+                raise ValueError("不支持实例策略 %s；仅支持 IgnoreNew / StopExisting。" % mip)
+            if mip == "StopExisting":
+                conflict = "kill_previous"
+            en = (settings_el.findtext(_q("Enabled"), default="true") or "").strip().lower()
+            if en not in ("true", "false", "1", "0"):
+                raise ValueError("任务 Enabled 值无效。")
+            enabled = en not in ("false", "0")
+        except (ValueError, OverflowError) as e:
+            return None, python_dir_found, "无法导入设置：%s" % e
+    enabled = enabled and trigger_enabled not in ("false", "0")
 
     # ---- 任务名：URI 末段 > Description > 文件名
     uri = (root.findtext(_q("RegistrationInfo") + "/" + _q("URI"), default="") or "").strip()
     name = ""
     if uri:
-        name = uri.rstrip("/").split("/")[-1]
+        name = uri.replace("\\", "/").rstrip("/").split("/")[-1]
     if not name:
         name = (root.findtext(_q("RegistrationInfo") + "/" + _q("Description"), default="") or "").strip()
     if not name:
@@ -1110,6 +1403,8 @@ def import_task_xml(path):
         t["trigger_time"] = chosen["time"].strftime("%H:%M:%S")
         t["every_n_days"] = chosen["n"]
         t["start_date"] = chosen["start_date"].strftime("%Y-%m-%d")
+        t["daily_repeat_every"] = chosen["every"]
+        t["daily_repeat_duration"] = chosen["duration"]
     else:
         t["trigger_type"] = "interval"
         t["interval_start"] = chosen["start"].strftime(TIME_FMT)
@@ -1124,54 +1419,75 @@ def _xml_escape(s):
 
 
 def export_task_xml(task, python_exe, path):
-    """把任务导出为 Windows 任务计划程序 XML（可用任务计划程序重新导入）"""
+    """导出支持的触发器；无法满足 Windows XML 限制时明确拒绝。"""
     name = task.get("name") or task["id"]
     en = "true" if task.get("enabled", True) else "false"
 
-    trig_lines = []
+    def repetition_lines(every, duration):
+        if not 60 <= every <= 31 * 86400:
+            raise ValueError("Windows XML 重复间隔必须在 1 分钟至 31 天之间。")
+        if duration and (duration < 60 or every > duration):
+            raise ValueError("Windows XML 持续时间至少为 1 分钟，且不能小于重复间隔。")
+        lines = ["      <Repetition>",
+                 "        <Interval>%s</Interval>" % fmt_iso_duration(every)]
+        if duration:
+            lines.append("        <Duration>%s</Duration>" % fmt_iso_duration(duration))
+        return lines + ["        <StopAtDurationEnd>false</StopAtDurationEnd>", "      </Repetition>"]
+
     tt = task.get("trigger_type", "daily")
     if tt == "once":
-        dt = parse_dt(task.get("once_datetime") or "") or datetime.now()
+        dt = parse_dt(task.get("once_datetime") or "")
+        if dt is None:
+            raise ValueError("单次运行日期时间无效。")
         trig_lines = [
             "    <TimeTrigger>",
-            "      <StartBoundary>%s</StartBoundary>" % dt.strftime("%Y-%m-%dT%H:%M:%S"),
             "      <Enabled>%s</Enabled>" % en,
+            "      <StartBoundary>%s</StartBoundary>" % dt.strftime("%Y-%m-%dT%H:%M:%S"),
             "    </TimeTrigger>",
         ]
     elif tt == "daily":
+        if not re.fullmatch(r"\d{1,2}(?::\d{1,2}){0,2}", str(task.get("trigger_time") or "").strip()) or not hms_valid(task.get("trigger_time")):
+            raise ValueError("每天的开始时间无效。")
         h, m, s = parse_hms(task.get("trigger_time"))
-        n = max(1, int(task.get("every_n_days") or 1))
-        sd = task.get("start_date") or datetime.now().strftime("%Y-%m-%d")
+        n = _schedule_integer(task.get("every_n_days", 1), "每隔天数", 1)
+        if n > 365:
+            raise ValueError("Windows XML 每隔天数必须在 1 至 365 之间。")
+        sd = parse_date(task.get("start_date")) if task.get("start_date") else datetime.now().date()
+        if sd is None:
+            raise ValueError("起始日期无效。")
+        sd = sd.isoformat()
+        every, duration = _daily_repeat_values(task.get("daily_repeat_every", 0),
+                                             task.get("daily_repeat_duration", 0), n)
         sb = "%sT%02d:%02d:%02d" % (sd, h, m, s)
         trig_lines = [
             "    <CalendarTrigger>",
-            "      <StartBoundary>%s</StartBoundary>" % sb,
             "      <Enabled>%s</Enabled>" % en,
+            "      <StartBoundary>%s</StartBoundary>" % sb,
+        ]
+        if every:
+            trig_lines += repetition_lines(every, duration)
+        trig_lines += [
             "      <ScheduleByDay>",
             "        <DaysInterval>%d</DaysInterval>" % n,
             "      </ScheduleByDay>",
             "    </CalendarTrigger>",
         ]
-    else:
-        start = parse_dt(task.get("interval_start") or "") or datetime.now()
-        every = fmt_iso_duration(max(1, int(task.get("interval_every") or 60)))
-        dur = int(task.get("interval_duration") or 0)
-        rep = [
-            "      <Repetition>",
-            "        <Interval>%s</Interval>" % every,
-        ]
-        if dur > 0:
-            rep.append("        <Duration>%s</Duration>" % fmt_iso_duration(dur))
-        rep.append("        <StopAtDurationEnd>true</StopAtDurationEnd>")
-        rep.append("      </Repetition>")
-        trig_lines = ["    <TimeTrigger>"] + rep + [
-            "      <StartBoundary>%s</StartBoundary>" % start.strftime("%Y-%m-%dT%H:%M:%S"),
+    elif tt == "interval":
+        start = parse_dt(task.get("interval_start") or "")
+        if start is None:
+            raise ValueError("重复任务的起始日期时间无效。")
+        every = _schedule_integer(task.get("interval_every", 300), "重复间隔", 1)
+        duration = _schedule_integer(task.get("interval_duration", 0), "重复持续时间")
+        trig_lines = [
+            "    <TimeTrigger>",
             "      <Enabled>%s</Enabled>" % en,
-            "    </TimeTrigger>",
-        ]
+            "      <StartBoundary>%s</StartBoundary>" % start.strftime("%Y-%m-%dT%H:%M:%S"),
+        ] + repetition_lines(every, duration) + ["    </TimeTrigger>"]
+    else:
+        raise ValueError("不支持的触发类型：%s" % tt)
 
     mip = "StopExisting" if task.get("conflict") == "kill_previous" else "IgnoreNew"
-    etl = fmt_iso_duration(int(task.get("timeout") or 0))
+    etl = fmt_iso_duration(_schedule_integer(task.get("timeout", 0), "超时限制"))
 
     args_tokens = [str(task.get("script") or "")]
     if str(task.get("args") or "").strip():
@@ -1203,7 +1519,7 @@ def export_task_xml(task, python_exe, path):
         "    <ExecutionTimeLimit>%s</ExecutionTimeLimit>" % etl,
         "    <Priority>7</Priority>",
         "  </Settings>",
-        '  <Actions Context="Author">',
+        "  <Actions>",
         "    <Exec>",
         "      <Command>%s</Command>" % _xml_escape(python_exe),
         "      <Arguments>%s</Arguments>" % _xml_escape(args_str),
@@ -1383,16 +1699,48 @@ class TaskDialog(tk.Toplevel):
         # 每天 / 每隔 N 天
         self.f_daily = ttk.Frame(self.trig_holder)
         self.daily_time = tk.StringVar(value=t.get("trigger_time") or "09:00:00")
-        self.daily_n = tk.StringVar(value=str(max(1, int(t.get("every_n_days") or 1))))
+        self.daily_n = tk.StringVar(value=str(t.get("every_n_days", 1)))
         self.daily_start = tk.StringVar(value=t.get("start_date") or "")
-        ttk.Label(self.f_daily, text="时间：").pack(side="left")
-        ttk.Entry(self.f_daily, textvariable=self.daily_time, width=10).pack(side="left", padx=(0, 10))
-        ttk.Label(self.f_daily, text="每隔").pack(side="left")
-        ttk.Spinbox(self.f_daily, from_=1, to=9999, textvariable=self.daily_n, width=6).pack(side="left", padx=2)
-        ttk.Label(self.f_daily, text="天运行一次").pack(side="left", padx=(0, 10))
-        ttk.Label(self.f_daily, text="起始日期：").pack(side="left")
-        ttk.Entry(self.f_daily, textvariable=self.daily_start, width=12).pack(side="left")
-        ttk.Label(self.f_daily, text="（空=今天）", foreground="#777").pack(side="left", padx=(4, 0))
+        daily_row = ttk.Frame(self.f_daily)
+        daily_row.pack(anchor="w")
+        ttk.Label(daily_row, text="开始时间：").pack(side="left")
+        ttk.Entry(daily_row, textvariable=self.daily_time, width=10).pack(side="left", padx=(0, 10))
+        ttk.Label(daily_row, text="每隔").pack(side="left")
+        ttk.Spinbox(daily_row, from_=1, to=9999, textvariable=self.daily_n, width=6).pack(side="left", padx=2)
+        ttk.Label(daily_row, text="天触发").pack(side="left", padx=(0, 10))
+        ttk.Label(daily_row, text="起始日期：").pack(side="left")
+        ttk.Entry(daily_row, textvariable=self.daily_start, width=12).pack(side="left")
+        ttk.Label(daily_row, text="（空=今天）", foreground="#777").pack(side="left", padx=(4, 0))
+
+        repeat_every = safe_int(t.get("daily_repeat_every"), 0)
+        repeat_duration = safe_int(t.get("daily_repeat_duration"), 0)
+        self.daily_repeat_enabled = tk.BooleanVar(value=repeat_every != 0)
+        every_n, every_u = split_secs(repeat_every or 300)
+        dur_n, dur_u = split_secs(repeat_duration if repeat_every else 3600)
+        self.daily_every = tk.StringVar(value=str(every_n))
+        self.daily_every_unit = tk.StringVar(value=every_u)
+        self.daily_dur = tk.StringVar(value=str(dur_n))
+        self.daily_dur_unit = tk.StringVar(value=dur_u)
+        repeat_row = ttk.Frame(self.f_daily)
+        repeat_row.pack(anchor="w", pady=(8, 0))
+        ttk.Checkbutton(repeat_row, text="重复任务，每", variable=self.daily_repeat_enabled,
+                        command=self._switch_daily_repeat).pack(side="left")
+        every_entry = ttk.Spinbox(repeat_row, from_=1, to=999999, textvariable=self.daily_every, width=7)
+        every_entry.pack(side="left", padx=2)
+        every_unit = ttk.Combobox(repeat_row, textvariable=self.daily_every_unit,
+                                  values=UNIT_ORDER, state="readonly", width=5)
+        every_unit.pack(side="left")
+        ttk.Label(repeat_row, text="运行一次，持续").pack(side="left", padx=(6, 0))
+        dur_entry = ttk.Spinbox(repeat_row, from_=1, to=999999, textvariable=self.daily_dur, width=7)
+        dur_entry.pack(side="left", padx=2)
+        dur_unit = ttk.Combobox(repeat_row, textvariable=self.daily_dur_unit,
+                                values=UNIT_ORDER, state="readonly", width=5)
+        dur_unit.pack(side="left")
+        self.daily_repeat_widgets = ((every_entry, "normal"), (every_unit, "readonly"),
+                                     (dur_entry, "normal"), (dur_unit, "readonly"))
+        ttk.Label(self.f_daily, text="未勾选时仅运行一次；可跨午夜，持续时间不超过 N 天；截止时刻可触发，运行中的任务不强停。",
+                  foreground="#777", wraplength=590).pack(anchor="w", pady=(5, 0))
+        self._switch_daily_repeat()
 
         # 间隔重复
         self.f_interval = ttk.Frame(self.trig_holder)
@@ -1424,6 +1772,10 @@ class TaskDialog(tk.Toplevel):
         ttk.Combobox(self.f_interval, textvariable=self.iv_dur_unit, values=UNIT_ORDER,
                      state="readonly", width=5).pack(side="left", padx=(0, 2))
         ttk.Label(self.f_interval, text="（0 = 无限期）", foreground="#777").pack(side="left")
+
+    def _switch_daily_repeat(self):
+        for widget, enabled_state in self.daily_repeat_widgets:
+            widget.configure(state=enabled_state if self.daily_repeat_enabled.get() else "disabled")
 
     def _switch_trigger(self):
         for f in (self.f_once, self.f_daily, self.f_interval):
@@ -1464,6 +1816,63 @@ class TaskDialog(tk.Toplevel):
 
     # ------------------------------------------------------------------
 
+    def _form_updates(self):
+        """先完整解析表单，验证失败时不改动共享任务。"""
+        def clock_value(value):
+            value = value.strip()
+            if not re.fullmatch(r"\d{1,2}(?::\d{1,2}){0,2}", value) or not hms_valid(value):
+                raise ValueError("时间格式不正确（HH:MM:SS）。")
+            return "%02d:%02d:%02d" % parse_hms(value)
+
+        def date_time(date_var, time_var):
+            date = parse_date(date_var.get().strip())
+            if date is None:
+                raise ValueError("日期格式不正确（YYYY-MM-DD）。")
+            return "%s %s" % (date.isoformat(), clock_value(time_var.get()))
+
+        def seconds(number_var, unit_var, label, minimum):
+            unit = unit_var.get()
+            if unit not in UNIT_SECONDS:
+                raise ValueError("%s的单位无效。" % label)
+            value = _schedule_integer(number_var.get(), label, minimum) * UNIT_SECONDS[unit]
+            timedelta(seconds=value)
+            return value
+
+        key = self._trigger_key()
+        updates = {
+            "name": self.var_name.get().strip() or "未命名任务",
+            "group": self.var_group.get().strip() or "默认分组",
+            "script": self.var_script.get().strip(),
+            "args": self.var_args.get().strip(),
+            "workdir": self.var_workdir.get().strip(),
+            "console": self.var_console.get(),
+            "trigger_type": key,
+            "timeout": _schedule_integer(self.var_timeout.get(), "超时限制"),
+            "conflict": {v: k for k, v in CONFLICT_LABELS.items()}.get(self.var_conflict.get(), "skip_new"),
+        }
+        if key == "once":
+            updates["once_datetime"] = date_time(self.once_date, self.once_time)
+        elif key == "daily":
+            updates["trigger_time"] = clock_value(self.daily_time.get())
+            days = _schedule_integer(self.daily_n.get(), "每隔天数", 1)
+            timedelta(days=days)
+            sd = self.daily_start.get().strip()
+            start_date = parse_date(sd) if sd else datetime.now().date()
+            if start_date is None:
+                raise ValueError("起始日期格式不正确（YYYY-MM-DD）。")
+            every, duration = 0, 0
+            if self.daily_repeat_enabled.get():
+                every = seconds(self.daily_every, self.daily_every_unit, "重复间隔", 1)
+                duration = seconds(self.daily_dur, self.daily_dur_unit, "重复持续时间", 1)
+                every, duration = _daily_repeat_values(every, duration, days)
+            updates.update(every_n_days=days, start_date=start_date.isoformat(),
+                           daily_repeat_every=every, daily_repeat_duration=duration)
+        else:
+            updates["interval_start"] = date_time(self.iv_date, self.iv_time)
+            updates["interval_every"] = seconds(self.iv_every, self.iv_every_unit, "重复间隔", 1)
+            updates["interval_duration"] = seconds(self.iv_dur, self.iv_dur_unit, "重复持续时间", 0)
+        return updates
+
     def _validate(self):
         if not self.var_script.get().strip():
             messagebox.showwarning(APP_NAME, "请填写脚本路径。", parent=self)
@@ -1476,72 +1885,41 @@ class TaskDialog(tk.Toplevel):
             if not os.path.isfile(check):
                 if not messagebox.askyesno(APP_NAME, "脚本文件不存在：\n%s\n\n仍要保存吗？" % sp, parent=self):
                     return False
-        key = self._trigger_key()
-        if key == "once":
-            if parse_dt("%s %s" % (self.once_date.get().strip(), self.once_time.get().strip())) is None:
-                messagebox.showwarning(APP_NAME, "单次运行的日期/时间格式不正确。\n应为 YYYY-MM-DD  HH:MM:SS", parent=self)
-                return False
-        elif key == "daily":
-            if not hms_valid(self.daily_time.get()):
-                messagebox.showwarning(APP_NAME, "时间格式不正确（HH:MM:SS）。", parent=self)
-                return False
-            sd = self.daily_start.get().strip()
-            if sd and parse_date(sd) is None:
-                messagebox.showwarning(APP_NAME, "起始日期格式不正确（YYYY-MM-DD）。", parent=self)
-                return False
-        else:
-            if parse_dt("%s %s" % (self.iv_date.get().strip(), self.iv_time.get().strip())) is None:
-                messagebox.showwarning(APP_NAME, "重复任务的起始日期/时间格式不正确。", parent=self)
-                return False
-            try:
-                if int(self.iv_every.get()) < 1:
-                    raise ValueError
-            except (ValueError, TypeError):
-                messagebox.showwarning(APP_NAME, "重复间隔必须 ≥ 1。", parent=self)
-                return False
+        try:
+            self._validated_updates = self._form_updates()
+        except ValueError as e:
+            messagebox.showwarning(APP_NAME, str(e), parent=self)
+            return False
+        except OverflowError:
+            messagebox.showwarning(APP_NAME, "调度间隔或持续时间超出可计算范围。", parent=self)
+            return False
         return True
 
     def _on_save(self):
         if not self._validate():
             return
-        t = self.task
-        t["name"] = self.var_name.get().strip() or "未命名任务"
-        t["group"] = self.var_group.get().strip() or "默认分组"
-        t["script"] = self.var_script.get().strip()
-        t["args"] = self.var_args.get().strip()
-        t["workdir"] = self.var_workdir.get().strip()
-        t["console"] = self.var_console.get()
-        key = self._trigger_key()
-        t["trigger_type"] = key
-        if key == "once":
-            t["once_datetime"] = "%s %s" % (self.once_date.get().strip(), self.once_time.get().strip())
-        elif key == "daily":
-            h, m, s = parse_hms(self.daily_time.get())
-            t["trigger_time"] = "%02d:%02d:%02d" % (h, m, s)
-            try:
-                t["every_n_days"] = max(1, int(self.daily_n.get()))
-            except (ValueError, TypeError):
-                t["every_n_days"] = 1
-            t["start_date"] = self.daily_start.get().strip() or None
-        else:
-            t["interval_start"] = "%s %s" % (self.iv_date.get().strip(), self.iv_time.get().strip())
-            try:
-                t["interval_every"] = max(1, int(self.iv_every.get())) * UNIT_SECONDS.get(self.iv_every_unit.get(), 1)
-            except (ValueError, TypeError):
-                t["interval_every"] = 300
-            try:
-                dn = int(self.iv_dur.get())
-            except (ValueError, TypeError):
-                dn = 0
-            t["interval_duration"] = dn * UNIT_SECONDS.get(self.iv_dur_unit.get(), 60) if dn > 0 else 0
+        updates = self._validated_updates
+        schedule_fields = {"trigger_type", "once_datetime", "trigger_time", "every_n_days",
+                           "start_date", "daily_repeat_every", "daily_repeat_duration",
+                           "interval_start", "interval_every", "interval_duration"}
         try:
-            t["timeout"] = max(0, int(self.var_timeout.get()))
-        except (ValueError, TypeError):
-            t["timeout"] = 0
-        rev = {v: k for k, v in CONFLICT_LABELS.items()}
-        t["conflict"] = rev.get(self.var_conflict.get(), "skip_new")
-        t["finished"] = False
-        t["next_run"] = iso(compute_next_run(t, datetime.now()))
+            with CFG_LOCK:
+                t = self.task
+                changed = any(t.get(k) != v for k, v in updates.items())
+                if any(t.get(k) != v for k, v in updates.items() if k in schedule_fields):
+                    draft = dict(t)
+                    draft.update(updates, finished=False)
+                    updates["finished"] = False
+                    updates["next_run"] = iso(compute_next_run(draft, datetime.now()))
+                # 调度线程的运行记录可能已更新，只写入表单字段及必要的下次运行时间。
+                t.update(updates)
+                master = self.__dict__.get("master")
+                sched = getattr(master, "sched", None) if master is not None else None
+                if changed and sched is not None:
+                    sched._generations[t["id"]] = sched._generations.get(t["id"], 0) + 1
+        except OverflowError:
+            messagebox.showwarning(APP_NAME, "下次运行时间超出可计算范围，请缩短调度间隔。", parent=self)
+            return
         self.ok = True
         self.destroy()
 
@@ -1550,7 +1928,7 @@ class TaskDialog(tk.Toplevel):
 # GUI：设置对话框
 # ----------------------------------------------------------------------------
 
-MISSED_POLICY_LABELS = {"run_once": "错过 5 分钟内补跑一次（推荐）", "skip": "错过的执行直接跳过"}
+MISSED_POLICY_LABELS = {"run_once": "周期任务迟到超过 5 分钟补跑一次", "skip": "周期任务迟到超过 5 分钟直接跳过"}
 
 
 class SettingsDialog(tk.Toplevel):
@@ -1702,8 +2080,11 @@ class SettingsDialog(tk.Toplevel):
         # 记住看门狗开关：False = 下次启动不再自动注册
         s["watchdog_enabled"] = want_wd
 
+        self.master.sched.mark_dirty()
+        if not save_config(self.master.cfg):
+            messagebox.showerror(APP_NAME, "配置保存失败，设置尚未落盘，请检查目录权限或磁盘空间后重试。", parent=self)
+            return
         self.ok = True
-        save_config(self.master.cfg)
         self.destroy()
         if problems:
             messagebox.showwarning(APP_NAME, "设置已保存，但部分自启项未生效：\n\n" + "\n".join(problems),
@@ -1904,10 +2285,8 @@ class RunsWindow(tk.Toplevel):
         now_dt = datetime.now()
         now_epoch = time.time()
         rows = []
+        sequence = 0
         for fn in run_files:
-            if len(rows) >= MAX_RUN_ROWS:
-                break
-            file_rows = []
             try:
                 with open(os.path.join(LOGS_DIR, fn), "r", encoding="utf-8") as f:
                     for line in f:
@@ -1917,6 +2296,8 @@ class RunsWindow(tk.Toplevel):
                         try:
                             r = json.loads(line)
                         except Exception:
+                            continue
+                        if not isinstance(r, dict):
                             continue
                         if name_f != "全部" and (r.get("task_name") or "") != name_f:
                             continue
@@ -1933,13 +2314,15 @@ class RunsWindow(tk.Toplevel):
                                 continue
                             if range_f == "近 1 小时" and now_epoch - eps > 3600:
                                 continue
-                        file_rows.append(r)
-                        if len(rows) + len(file_rows) >= MAX_RUN_ROWS:
-                            break
+                        sequence += 1
+                        item = (str(r.get("time") or r.get("end") or r.get("start") or ""), sequence, r)
+                        if len(rows) < MAX_RUN_ROWS:
+                            heapq.heappush(rows, item)
+                        elif item[:2] > rows[0][:2]:
+                            heapq.heapreplace(rows, item)
             except OSError:
                 continue
-            file_rows.reverse()      # 文件内：新 → 旧
-            rows.extend(file_rows)   # 文件迭代顺序已是 新 → 旧
+        rows = [item[2] for item in sorted(rows, reverse=True)]
         for r in rows:
             tags = ()
             st = r.get("status") or ""
@@ -2310,8 +2693,10 @@ class App(tk.Tk):
         dlg = TaskDialog(self, t, groups)
         self.wait_window(dlg)
         if dlg.ok:
-            self.cfg["tasks"].append(t)
-            save_config(self.cfg)
+            with CFG_LOCK:
+                self.cfg["tasks"].append(t)
+                self.sched.mark_dirty()
+                save_config(self.cfg)
             self._need_rebuild = True
 
     def _edit_task(self):
@@ -2327,7 +2712,9 @@ class App(tk.Tk):
         dlg = TaskDialog(self, t, groups)
         self.wait_window(dlg)
         if dlg.ok:
-            save_config(self.cfg)
+            with CFG_LOCK:
+                self.sched.mark_dirty()
+                save_config(self.cfg)
             self._need_rebuild = True
 
     def _delete_task(self):
@@ -2341,12 +2728,18 @@ class App(tk.Tk):
                     "任务「%s」正在运行。\n删除后运行中的进程将被终止。确定删除？"
                     % t.get("name"), parent=self):
                 return
-            self.sched.kill_running(t["id"])
         elif not messagebox.askyesno(APP_NAME, "确定删除任务「%s」？" % t.get("name"), parent=self):
             return
-        self.cfg["tasks"].remove(t)
-        self.sched.running.pop(t["id"], None)
-        save_config(self.cfg)
+        if not self.sched.cancel_task(t["id"]):
+            messagebox.showerror(APP_NAME, "未能确认任务进程已结束，已保留任务并停用后续调度。", parent=self)
+            self._need_rebuild = True
+            return
+        with CFG_LOCK:
+            if t in self.cfg["tasks"]:
+                self.cfg["tasks"].remove(t)
+            self.sched.running.pop(t["id"], None)
+            self.sched.mark_dirty()
+            save_config(self.cfg)
         self._need_rebuild = True
 
     def _toggle_task(self):
@@ -2354,10 +2747,15 @@ class App(tk.Tk):
         if t is None:
             messagebox.showinfo(APP_NAME, "请先选中一个任务。", parent=self)
             return
-        t["enabled"] = not t.get("enabled")
-        if t["enabled"] and not t.get("finished"):
-            t["next_run"] = iso(compute_next_run(t, datetime.now()))
-        save_config(self.cfg)
+        with CFG_LOCK:
+            t["enabled"] = not t.get("enabled")
+            self.sched._generations[t["id"]] = self.sched._generations.get(t["id"], 0) + 1
+            if t["enabled"]:
+                self.sched._cancelled.discard(t["id"])
+                if not t.get("finished"):
+                    t["next_run"] = iso(compute_next_run(t, datetime.now()))
+            self.sched.mark_dirty()
+            save_config(self.cfg)
         self._need_rebuild = True
 
     def _duplicate_task(self, t):
@@ -2365,6 +2763,9 @@ class App(tk.Tk):
         nt = dict(t)
         nt["id"] = uuid.uuid4().hex[:12]
         nt["name"] = (t.get("name") or "任务") + " 副本"
+        nt.pop("active_run", None)
+        nt.update(finished=False, last_run=None, last_result=None, last_run_duration=None)
+        nt["next_run"] = iso(compute_next_run(nt, datetime.now()))
         groups = []
         for x in self.cfg["tasks"]:
             g = x.get("group") or "默认分组"
@@ -2373,8 +2774,10 @@ class App(tk.Tk):
         dlg = TaskDialog(self, nt, groups)
         self.wait_window(dlg)
         if dlg.ok:
-            self.cfg["tasks"].append(nt)
-            save_config(self.cfg)
+            with CFG_LOCK:
+                self.cfg["tasks"].append(nt)
+                self.sched.mark_dirty()
+                save_config(self.cfg)
             self._need_rebuild = True
 
     def _open_today_log(self, t):
@@ -2418,8 +2821,10 @@ class App(tk.Tk):
             msgs.append("已自动填入 Python 目录：%s" % pydir)
         if warn:
             msgs.append(warn)
-        self.cfg["tasks"].append(t)
-        save_config(self.cfg)
+        with CFG_LOCK:
+            self.cfg["tasks"].append(t)
+            self.sched.mark_dirty()
+            save_config(self.cfg)
         self._need_rebuild = True
         messagebox.showinfo(
             APP_NAME,
@@ -2465,6 +2870,7 @@ class App(tk.Tk):
     # ---- 关闭 ------------------------------------------------------------
 
     def _on_close(self):
+        self.sched.set_closing(True)
         try:
             # 快照遍历：fire 工作线程可能并发写入 running，直接 items() 会 RuntimeError
             running = [tid for tid, p in list(self.sched.running.items()) if p.poll() is None]
@@ -2478,19 +2884,29 @@ class App(tk.Tk):
                     return
                 if r:
                     for tid in running:
-                        self.sched.kill_running(tid)
+                        if not self.sched.kill_running(tid):
+                            messagebox.showerror(APP_NAME, "任务进程未能结束，已取消退出。", parent=self)
+                            return
             if watchdog_state():
                 if messagebox.askyesno(
                         APP_NAME,
                         "检测到看门狗仍在运行。\n\n【是】退出并暂停看门狗拉起（下次启动程序时自动恢复）\n【否】仅退出（约 2 分钟内会被看门狗重新拉起）",
                         parent=self):
-                    watchdog_set(False)
+                    ok, detail = watchdog_set(False)
+                    if not ok:
+                        messagebox.showerror(APP_NAME, "暂停看门狗失败，已取消退出：\n" + detail, parent=self)
+                        return
+            if not save_config(self.cfg):
+                messagebox.showerror(APP_NAME, "配置保存失败，已取消退出，请检查目录权限和磁盘空间。", parent=self)
+                return
+            self.sched.stop()
+            self.destroy()
         except Exception:
             _exhook(*sys.exc_info())
+            messagebox.showerror(APP_NAME, "退出准备失败，程序仍在运行，请查看错误日志。", parent=self)
+            return
         finally:
-            self.sched.stop()
-            save_config(self.cfg)
-            self.destroy()
+            self.sched.set_closing(False)
 
 
 # ----------------------------------------------------------------------------

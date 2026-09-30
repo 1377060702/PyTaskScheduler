@@ -14,3 +14,8 @@ _build/
 build/
 dist/
 *.spec
+
+# IDE 配置（JetBrains 本机私有配置）
+.idea/
+
+superpowers
